@@ -1,104 +1,136 @@
-import os, platform, subprocess, dotbot, sys
+import dotbot
+import platform
+import subprocess
+
 
 class Brew(dotbot.Plugin):
-    _brewDirective = "brew"
-    _caskDirective = "cask"
-    _tapDirective = "tap"
-    _brewFileDirective = "brewfile"
+    _brew_directive = "brew"
+    _brewfile_directive = "brewfile"
+    _cask_directive = "cask"
+    _tap_directive = "tap"
+    _install_url = "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
+
+    # From https://docs.brew.sh/Installation these are the default and recommended
+    # installation paths.
+    if platform.sys.platform == "darwin":
+        _is_macos = True
+        _homebrew_path = "/usr/local"
+        if platform.machine() == "arm64":
+            _homebrew_path = "/opt/homebrew"
+    elif platform.sys.platform == "linux":
+        _is_macos = False
+        _homebrew_path = "/home/linuxbrew/.linuxbrew"
+
+    # Construct the env vars that `brew shellenv` returns
+    _homebrew_envs = {
+        "HOMEBREW_PREFIX": _homebrew_path,
+        "HOMEBREW_CELLAR": f"{_homebrew_path}/Cellar",
+        "HOMEBREW_REPOSITORY": _homebrew_path,
+        "PATH": f"{_homebrew_path}/bin:{_homebrew_path}/sbin${{PATH+:$PATH}}",
+        "MANPATH": f"{_homebrew_path}/share/man${{MANPATH+:$MANPATH}}:",
+        "INFOPATH": f"{_homebrew_path}/share/info:${{INFOPATH:-}}",
+    }
 
     def can_handle(self, directive):
-        return directive in (self._tapDirective, self._brewDirective, self._caskDirective, self._brewFileDirective)
+        directives = [
+            self._tap_directive,
+            self._brew_directive,
+            self._brewfile_directive,
+        ]
+
+        if self._is_macos:
+            directives.append(self._cask_directive)
+
+        return directive in tuple(directives)
 
     def handle(self, directive, data):
-        if directive == self._tapDirective:
+        if not self.can_handle(directive):
+            raise ValueError(f"Brew cannot handle directive {directive}")
+
+        try:
+            self._run_cmd("hash brew", capture_output=False)
+        except subprocess.CalledProcessError:
+            self._log.info("Brew not found, installing")
             self._bootstrap_brew()
-            return self._tap(data)
-        if directive == self._brewDirective:
-            self._bootstrap_brew()
-            return self._process_data("brew install", data)
-        if directive == self._caskDirective:
-            if sys.platform.startswith("darwin"):
-                self._bootstrap_cask()
+
+        if self._is_macos:
+            self._run_cmd("brew tap homebrew/cask")
+
+        match directive:
+            case self._tap_directive:
+                return self._tap(data)
+            case self._brew_directive:
+                return self._process_data("brew install", data)
+            case self._cask_directive:
                 return self._process_data("brew install --cask", data)
-            else:
-                return True
-        if directive == self._brewFileDirective:
-            self._bootstrap_brew()
-            self._bootstrap_cask()
-            return self._install_bundle(data)
-        raise ValueError('Brew cannot handle directive %s' % directive)
+            case self._brewfile_directive:
+                return self._install_bundle(data)
+
+    def _run_cmd(self, cmd, capture_output=True, include_envs=True):
+        if include_envs:
+            cmd = f'eval "$({self._homebrew_envs})" && {cmd}'
+        self._log.lowinfo(cmd)
+        return subprocess.run(
+            cmd,
+            shell=True,
+            check=True,
+            capture_output=capture_output,
+            cwd=self._context.base_directory(),
+        )
+
+    def _bootstrap_brew(self):
+        try:
+            self._run_cmd(
+                f'/bin/bash -c "$(curl -fsSL {self._install_url})"', include_envs=False
+            )
+        except subprocess.CalledProcessError:
+            self._log.warning("Brew could not be installed")
+        else:
+            self._log.info("Updating brew")
+            try:
+                self._run_cmd("brew update")
+            except subprocess.CalledProcessError:
+                self._log.warning("Brew could not be updated")
 
     def _tap(self, tap_list):
-        cwd = self._context.base_directory()
-        log = self._log
-        with open(os.devnull, 'w') as devnull:
-            stdin = stdout = stderr = devnull
-            for tap in tap_list:
-                log.info("Tapping %s" % tap)
-                cmd = "brew tap %s" % (tap)
-                result = subprocess.call(cmd, shell=True, cwd=cwd)
-
-                if result != 0:
-                    log.warning('Failed to tap [%s]' % tap)
-                    return False
-            return True
+        for tap in tap_list:
+            self._log.info(f"Tapping {tap}")
+            try:
+                self._run_cmd(f"brew tap {tap}")
+            except subprocess.CalledProcessError as e:
+                self._log.warning(f"Failed to tap [{tap}] - {e}")
+                return False
+        return True
 
     def _process_data(self, install_cmd, data):
+        install_type = "casks" if "--cask" in install_cmd else "formulae"
         success = self._install(install_cmd, data)
         if success:
-            self._log.info('All packages have been installed')
+            self._log.info(f"All brew {install_type} have been installed")
         else:
-            self._log.error('Some packages were not installed')
+            self._log.error(f"Some brew {install_type} were not installed")
         return success
 
     def _install(self, install_cmd, packages_list):
-        cwd = self._context.base_directory()
-        log = self._log
-        with open(os.devnull, 'w') as devnull:
-            stdin = stdout = stderr = devnull
-            for package in packages_list:
-                if install_cmd == 'brew install':
-                    cmd = "brew ls --versions %s" % package
-                else:
-                    cmd = "brew cask ls --versions %s" % package
-                isInstalled = subprocess.call(cmd, shell=True, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd)
-                if isInstalled != 0:
-                    log.info("Installing %s" % package)
-                    cmd = "%s %s" % (install_cmd, package)
-                    result = subprocess.call(cmd, shell=True, cwd=cwd)
-                    if result != 0:
-                        log.warning('Failed to install [%s]' % package)
-                        return False
-            return True
+        cask_flag = "--cask" if install_cmd != "brew install" else ""
+        for package in packages_list:
+            try:
+                self._run_cmd(f"brew ls --versions {cask_flag} {package}")
+            except subprocess.CalledProcessError:
+                self._log.info(f"Installing {package}")
+                try:
+                    self._run_cmd(f"{install_cmd} {cask_flag} {package}")
+                except subprocess.CalledProcessError as e:
+                    self._log.warning(f"Failed to install [{package}] - {e}")
+                    return False
+        return True
 
     def _install_bundle(self, brew_files):
-        cwd = self._context.base_directory()
-        log = self._log
-        with open(os.devnull, 'w') as devnull:
-            stdin = stdout = stderr = devnull
-            for f in brew_files:
-                log.info("Installing from file %s" % f)
-                cmd = "brew bundle --file=%s" % f
-                result = subprocess.call(cmd, shell=True, cwd=cwd)
-
-                if result != 0:
-                    log.warning('Failed to install file [%s]' % f)
-                    return False
-            return True
-
-    def _bootstrap(self, cmd):
-        with open(os.devnull, 'w') as devnull:
-            stdin = stdout = stderr = devnull
-            subprocess.call(cmd, shell=True, stdin=stdin, stdout=stdout, stderr=stderr,
-                            cwd=self._context.base_directory())
-
-    def _bootstrap_brew(self):
-        link = "https://raw.githubusercontent.com/Homebrew/install/master/install.sh"
-        cmd = """hash brew || /bin/bash -c "$(curl -fsSL {0})";
-              brew update""".format(link)
-        self._bootstrap(cmd)
-
-    def _bootstrap_cask(self):
-        self._bootstrap_brew()
-        cmd = "brew tap caskroom/cask"
-        self._bootstrap(cmd)
+        for brew_file in brew_files:
+            self._log.info(f"Installing from file {brew_file}")
+            try:
+                self._run_cmd(f"brew bundle --file={brew_file}")
+            except subprocess.CalledProcessError as e:
+                self._log.warning(f"Failed to install file [{brew_file}] - {e}")
+                return False
+        return True
